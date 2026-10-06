@@ -1,35 +1,21 @@
-import os
-from pathlib import Path
-from dotenv import load_dotenv
-
-# 项目根目录（study/reproduceQ&A_Assistant），用 __file__ 定位，与工作目录无关
-PROJECT_DIR = Path(__file__).resolve().parents[1]
-# 所有运行期生成的文件统一放这里
-FILES_DIR = PROJECT_DIR / "files"
-
-MEMORY_DIR = FILES_DIR / "memory_data"        # 记忆系统的 SQLite 库
-KNOWLEDGE_BASE_DIR = FILES_DIR / "knowledge_base"  # RAG 知识库
-REPORTS_DIR = FILES_DIR / "reports"           # 学习报告 JSON
-HF_CACHE_DIR = FILES_DIR / "hf_cache"         # HuggingFace 模型缓存
-GRADIO_TMP_DIR = FILES_DIR / "gradio_tmp"     # Gradio 上传的临时文件
-
-for _d in (MEMORY_DIR, KNOWLEDGE_BASE_DIR, REPORTS_DIR, HF_CACHE_DIR, GRADIO_TMP_DIR):
-    _d.mkdir(parents=True, exist_ok=True)
-
-load_dotenv(PROJECT_DIR / ".env")
-
-# 必须在 import gradio / hello_agents 之前设置：这两个路径是在模块导入时
-# 被读成常量的，之后再改不生效。用 setdefault 让 .env 或 shell 里的值优先。
-os.environ.setdefault("HF_HOME", str(HF_CACHE_DIR))
-os.environ.setdefault("GRADIO_TEMP_DIR", str(GRADIO_TMP_DIR))
-
-import time
 import json
+import os
+import time
 from datetime import datetime
 from typing import Dict, List, Optional, Any, Tuple
-from hello_agents.tools import MemoryTool, RAGTool
-from hello_agents.memory import MemoryConfig
+
+# paths 必须在 gradio / hello_agents 之前导入，它要先设置好 HF_HOME 和
+# GRADIO_TEMP_DIR——那两个变量在库被导入时就读成常量了。详见 paths.py。
+from paths import (
+    KNOWLEDGE_BASE_DIR,
+    MEMORY_DIR,
+    REPORTS_DIR,
+)
+
 import gradio as gr
+from hello_agents.memory import MemoryConfig
+from hello_agents.tools import MemoryTool, RAGTool
+
 
 class PDFLearningAssistant:
     """智能文档问答助手"""
@@ -114,8 +100,10 @@ class PDFLearningAssistant:
             str: 答案
         """
 
-        if not self.current_document:
-            return "⚠️ 请先加载文档！使用 load_document() 方法加载PDF文档。"
+        # 知识库存在 Qdrant 里、跨会话持久化，所以不要求本次会话必须先 load_document，
+        # 只要库里有文档就能提问
+        if not self.current_document and not self.list_documents():
+            return "⚠️ 知识库是空的，请先在「开始使用」页加载一份 PDF 文档。"
         
         self.memory_tool.run({
             "action":"add",
@@ -192,12 +180,105 @@ class PDFLearningAssistant:
         
         return {
             "会话时长": f"{duration:.0f}秒",
-            "加载文档": self.stats["documents_loaded"],
+            "本次加载": self.stats["documents_loaded"],
+            "知识库文档": len(self.list_documents()),
             "提问次数": self.stats["questions_asked"],
             "学习笔记": self.stats["concepts_learned"],
-            "当前文档": self.current_document or "未加载"
+            "当前文档": self.current_document or "（未指定，检索全部）"
         }
     
+    def list_documents(self) -> List[Dict[str, Any]]:
+        """列出知识库中已有的文档
+
+        RAGTool 没有提供"列出文档"的接口，这里直接遍历向量库的 payload，
+        按来源文件聚合。
+
+        Returns:
+            List[Dict]: 每个元素含 name / chunks / added_at
+        """
+        store = self.rag_tool._get_pipeline().get("store")
+        if store is None:
+            return []
+
+        docs: Dict[str, Dict[str, Any]] = {}
+        offset = None
+        while True:
+            points, offset = store.client.scroll(
+                collection_name=store.collection_name,
+                limit=256,
+                offset=offset,
+                with_payload=True,
+            )
+            for p in points:
+                payload = p.payload or {}
+                source = payload.get("source_path") or payload.get("source") or "未知来源"
+                name = os.path.basename(str(source))
+                entry = docs.setdefault(
+                    name, {"name": name, "chunks": 0, "added_at": payload.get("added_at")}
+                )
+                entry["chunks"] += 1
+            if offset is None:
+                break
+
+        return sorted(docs.values(), key=lambda d: d["name"])
+
+    def delete_document(self, name: str) -> Dict[str, Any]:
+        """从知识库删除指定文档的全部分块
+
+        Args:
+            name: 文档文件名（list_documents 返回的 name）
+
+        Returns:
+            Dict: success / message / deleted 块数
+        """
+        if not name:
+            return {"success": False, "message": "未指定文档", "deleted": 0}
+
+        store = self.rag_tool._get_pipeline().get("store")
+        if store is None:
+            return {"success": False, "message": "向量库不可用", "deleted": 0}
+
+        target_ids = []
+        offset = None
+        while True:
+            points, offset = store.client.scroll(
+                collection_name=store.collection_name,
+                limit=256,
+                offset=offset,
+                with_payload=True,
+            )
+            for p in points:
+                payload = p.payload or {}
+                source = payload.get("source_path") or payload.get("source") or ""
+                if os.path.basename(str(source)) == name:
+                    target_ids.append(p.id)
+            if offset is None:
+                break
+
+        if not target_ids:
+            return {"success": False, "message": f"未找到文档：{name}", "deleted": 0}
+
+        store.delete_vectors(target_ids)
+
+        # 当前文档被删掉时清空状态，避免继续对已删除的文档提问
+        if self.current_document == name:
+            self.current_document = None
+
+        self.memory_tool.run({
+            "action": "add",
+            "content": f"从知识库移除了文档《{name}》",
+            "memory_type": "episodic",
+            "importance": 0.6,
+            "event_type": "document_removed",
+            "session_id": self.session_id,
+        })
+
+        return {
+            "success": True,
+            "message": f"已删除《{name}》的 {len(target_ids)} 个分块",
+            "deleted": len(target_ids),
+        }
+
     def generate_report(self, save_to_file: bool = True) -> Dict[str, Any]:
         """生成学习报告
 
@@ -279,7 +360,7 @@ def create_gradio_ui():
         if assistant_state["assistant"] is None:
             return "", history + [
                 {"role": "user", "content": message},
-                {"role": "assistant", "content": "❌ 请先初始化助手并加载文档"},
+                {"role": "assistant", "content": "❌ 请先在「开始使用」页初始化助手"},
             ]
 
         if not message.strip():
@@ -309,6 +390,40 @@ def create_gradio_ui():
 
         assistant_state["assistant"].add_note(note_content, concept or None)
         return f"✅ 笔记已保存: {note_content[:50]}..."
+
+    def list_docs_ui():
+        """刷新文档列表，返回 (表格数据, 下拉选项)"""
+        if assistant_state["assistant"] is None:
+            return [], gr.update(choices=[], value=None)
+
+        docs = assistant_state["assistant"].list_documents()
+        rows = []
+        for d in docs:
+            added = d.get("added_at")
+            when = (
+                datetime.fromtimestamp(added).strftime("%Y-%m-%d %H:%M")
+                if isinstance(added, (int, float))
+                else "-"
+            )
+            rows.append([d["name"], d["chunks"], when])
+
+        names = [d["name"] for d in docs]
+        return rows, gr.update(choices=names, value=names[0] if names else None)
+
+    def delete_doc_ui(name: str):
+        """删除选中的文档，并刷新列表"""
+        if assistant_state["assistant"] is None:
+            rows, dd = list_docs_ui()
+            return "❌ 请先初始化助手", rows, dd
+
+        if not name:
+            rows, dd = list_docs_ui()
+            return "❌ 请先选择要删除的文档", rows, dd
+
+        result = assistant_state["assistant"].delete_document(name)
+        rows, dd = list_docs_ui()
+        prefix = "✅" if result["success"] else "❌"
+        return f"{prefix} {result['message']}", rows, dd
 
     def get_stats_ui() -> str:
         """获取统计信息"""
@@ -402,6 +517,29 @@ def create_gradio_ui():
 
             msg_input.submit(chat, inputs=[msg_input, chatbot], outputs=[msg_input, chatbot])
             send_btn.click(chat, inputs=[msg_input, chatbot], outputs=[msg_input, chatbot])
+
+        with gr.Tab("📂 文档管理"):
+            gr.Markdown("### 查看知识库中已加载的文档，可按需删除")
+            docs_refresh_btn = gr.Button("刷新列表", variant="primary")
+            docs_table = gr.Dataframe(
+                headers=["文档名", "分块数", "加载时间"],
+                datatype=["str", "number", "str"],
+                label="已加载文档",
+                interactive=False,
+            )
+            with gr.Row():
+                doc_selector = gr.Dropdown(label="选择要删除的文档", choices=[], scale=4)
+                docs_delete_btn = gr.Button("删除", variant="stop", scale=1)
+            docs_output = gr.Textbox(label="操作结果", interactive=False)
+
+            docs_refresh_btn.click(
+                list_docs_ui, outputs=[docs_table, doc_selector]
+            )
+            docs_delete_btn.click(
+                delete_doc_ui,
+                inputs=[doc_selector],
+                outputs=[docs_output, docs_table, doc_selector],
+            )
 
         with gr.Tab("📝 学习笔记"):
             gr.Markdown("### 记录学习心得和重要概念")
